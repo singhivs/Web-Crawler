@@ -1,0 +1,224 @@
+#!/usr/bin/env python3
+
+import argparse
+from collections import deque
+import socket
+import ssl
+from html.parser import HTMLParser
+
+DEFAULT_SERVER = "proj5.3700.network"
+DEFAULT_PORT = 443
+
+# HTTP status codes
+SUCCESS = 200
+FOUND = 302
+FORBIDDEN = 403
+NOT_FOUND = 404
+UNAVAILABLE = 503
+
+NEWLINE = "\r\n"
+CSRF = "\r\n\r\n"
+VERSION = "HTTP/1.1"
+LOGIN_URL = "/accounts/login/?next=/fakebook/"
+ROOT_URL = "https://proj5.3700.network/fakebook/"
+
+
+class rewriteHTMLParser(HTMLParser):
+
+    def __init__(self):
+        HTMLParser.__init__(self)
+        self.links_found = list()
+        self.secret_flags = list()
+    
+    #find the links on the page
+    def handle_starttag(self, tag, attrs):
+        if tag == "a":
+            for key, value in attrs:
+                if key == "href":
+                    self.links_found.append(value)
+
+    #find the secret flags 
+    def handle_data(self, data):
+        if "FLAG: " in data:
+            secret_flag = data.split(": ")[1]
+            if (secret_flag not in self.secret_flags):
+                self.secret_flags.append(secret_flag)
+
+
+class Crawler:
+    def __init__(self, args):
+        self.server = args.server
+        self.port = args.port
+        self.username = args.username
+        self.password = args.password
+
+        self.secret_flags = list()
+        self.visited = set()
+        self.unvisited = deque()
+        self.unvisited.append(ROOT_URL)  # add root page to unvisited
+
+        self.sessionid = None
+        self.csrftoken = None
+
+        # self.login() # log into Fakebook when starting program
+
+    # log in to Fakebook
+    def login(self):
+        # login_response contains a dictionary of info passed from the server
+        login_response = self.get_method(LOGIN_URL)
+
+        # get csrftoken & sessionid of cookies
+        for cookie in login_response["cookies"]:
+            cookie_info = cookie.split("; ")[0].split("=")
+            if "csrftoken" in cookie_info[0]:
+                self.csrftoken = cookie_info[1]
+            if "sessionid" in cookie_info[0]:
+                self.sessionid = cookie_info[1]
+
+        login_message_data = "username=" + self.username + "&password=" + \
+            self.password + "&csrfmiddlewaretoken=" + self.csrftoken + "&next=/fakebook/"
+        post_login_response = self.post_method(LOGIN_URL, login_message_data)
+        # get sessionid of cookies post login
+        for cookie in post_login_response["cookies"]:
+            cookie_info = cookie.split("; ")[0].split("=")
+            if "sessionid" in cookie_info[0]:
+                self.sessionid = cookie_info[1]
+        return self.post_method(LOGIN_URL, login_message_data)
+
+    # creates the message to be sent
+    def format_message(self, command, path):
+        return command + " " + path + " " + VERSION + NEWLINE + "Host: " + self.server
+
+    # handle http response, returns a dictionary
+    def handle_http_response(self, message_data):
+        response = dict()
+        # parse response based on new lines
+        message_data = message_data.split(NEWLINE)
+        response["body"] = message_data[-1]
+        response["status"] = int(message_data[0].split(" ")[1])
+        response["headers"] = dict()
+        response["cookies"] = list()
+        for message in message_data[1:]:  # for the rest of info
+            if ": " in message:
+                message_obj = message.split(": ")[0]
+                message_obj_data = message.split(": ")[1]
+                if message_obj == "Set-Cookie":  # record csrftoken & sessionid
+                    response["cookies"].append(message_obj_data)
+                else:
+                    response["headers"][message_obj] = message_obj_data
+
+        return response
+
+    # send http request and return response in dictionary format
+    def send_request(self, request):
+        # create an INET, STREAMing socket
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        # wrap to http socket
+        context = ssl.create_default_context()
+        ssl_sock = context.wrap_socket(sock, server_hostname=self.server)
+        ssl_sock.connect((self.server, self.port))
+        ssl_sock.send(request.encode('ascii'))
+        response_data = ssl_sock.recv(10000).decode('ascii')
+        ssl_sock.close()
+        return self.handle_http_response(response_data)
+
+    # handles cookies information
+    def handle_cookies(self):
+        cookies = dict()
+        if self.csrftoken is not None:
+            cookies["csrftoken"] = self.csrftoken
+        if self.sessionid is not None:
+            cookies["sessionid"] = self.sessionid
+        return cookies
+
+    # constructs cookies to be sent
+    def construct_cookies(self):
+        cookies = ""
+        if len(self.handle_cookies()) > 0:
+            for k in self.handle_cookies().keys():
+                if not self.handle_cookies()[k] is None:
+                    cookies += k + "=" + self.handle_cookies()[k] + "; "
+        return "Cookie: " + cookies[:-2]  # [:-2] to omit the last '; '
+
+    # get data from requested url path, returns response in dictionary format
+    def get_method(self, path):  # calls send_request
+        get_request = self.format_message("GET", path) + NEWLINE
+        cookies = self.construct_cookies() + NEWLINE
+        final_get_message = get_request + cookies + CSRF
+        return self.send_request(final_get_message)
+
+    # post data to the server, returns reponse in dictionary format
+    def post_method(self, path, message_data):
+        post_request = self.format_message("POST", path) + NEWLINE
+        user_agent = "User-Agent: cs3700-webcrawler/1.1" + NEWLINE
+        content_type = "Content-Type: application/x-www-form-urlencoded" + NEWLINE
+        content_length = "Content-Length: " + str(len(message_data)) + NEWLINE
+        connection = "Connection: close" + NEWLINE
+        cookie = self.construct_cookies() + NEWLINE
+
+        # construct final post message
+        final_post_message = post_request + user_agent + content_type + \
+            content_length + connection + cookie + NEWLINE + message_data + CSRF
+        return self.send_request(final_post_message)
+
+    def run(self):
+        homePage = self.login()
+        status_code = homePage["status"]
+
+        while len(self.unvisited) > 0:
+            # and len(self.secret_flags) < 5:
+            next_unvisited_url = self.unvisited.popleft()  # get next unvisited page url
+            self.visited.add(next_unvisited_url)  # mark page as visited
+            next_unvisited_content = self.get_method(
+                next_unvisited_url)  # get next unvisited page content
+
+            # get status code from server
+            status_code = next_unvisited_content["status"]
+
+            # handle status code
+            if status_code == SUCCESS:
+                # get html of current page
+                content_body = next_unvisited_content["body"]
+                parser = rewriteHTMLParser()
+                parser.feed(content_body)
+                links = parser.links_found
+
+                #parse only those links which have fakebook in them 
+                filter_links = list(
+                    filter(lambda link: "/fakebook/" in link, links))
+                for i in filter_links:
+                    link_url = f"http://{DEFAULT_SERVER}{i}"
+                    if link_url not in self.visited and link_url not in self.unvisited:
+                        self.unvisited.append(link_url)
+
+                self.secret_flags.extend(parser.secret_flags)
+                # found 5 flags, break out of while loop
+                if len(set(self.secret_flags)) == 5:
+                    for flag in set(self.secret_flags):
+                        print(flag)
+                    return set(self.secret_flags)
+            # try the request again using the new URL given by the server in the Location header
+            elif status_code == FOUND:
+                redirect_url = next_unvisited_content["headers"]["Location"]
+                self.unvisited.append(redirect_url)
+            # abandon the URL
+            elif status_code == FORBIDDEN or status_code == NOT_FOUND:
+                pass
+            # re-try the request for the URL until successful
+            elif status_code == UNAVAILABLE:
+                self.unvisited.append(next_unvisited_url)
+            else:
+                raise Exception("Invalid status code: " + str(status_code))
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='crawl Fakebook')
+    parser.add_argument('-s', dest="server", type=str,
+                        default=DEFAULT_SERVER, help="The server to crawl")
+    parser.add_argument('-p', dest="port", type=int,
+                        default=DEFAULT_PORT, help="The port to use")
+    parser.add_argument('username', type=str, help="The username to use")
+    parser.add_argument('password', type=str, help="The password to use")
+    args = parser.parse_args()
+    sender = Crawler(args)
+    sender.run()
